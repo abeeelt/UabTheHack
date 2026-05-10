@@ -3,7 +3,7 @@ from langgraph.graph import StateGraph, END
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from models import AgentState, TrialEvaluation
-from api_tools import fetch_clinical_trials
+from tools import fetch_clinical_trials
 
 # 1. INICIALIZAMOS EL LLM LOCAL
 llm = ChatOllama(model="llama3", temperature=0)

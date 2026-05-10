@@ -21,3 +21,7 @@ class AgentState(TypedDict):
     mesh_terms: List[str]
     retrieved_trials: List[dict]
     evaluated_trials: List[TrialEvaluation]
+
+class PatientExtraction(BaseModel):
+    primary_condition: str = Field(description="La enfermedad principal para buscar en ClinicalTrials.gov")
+    mesh_terms: List[str] = Field(description="Lista de términos MeSH o sinónimos asociados")

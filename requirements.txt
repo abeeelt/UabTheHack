@@ -1,0 +1,6 @@
+langgraph
+langchain
+langchain-openai # O el proveedor que vayas a usar
+pydantic
+requests
+python-dotenv

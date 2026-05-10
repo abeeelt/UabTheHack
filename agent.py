@@ -64,7 +64,35 @@ def evaluate_node(state: AgentState) -> AgentState:
 
     evaluated_list.sort(key=lambda x: x.score, reverse=True)
     return {"evaluated_trials": evaluated_list}
+import json
 
+def generate_dossier_node(state: AgentState) -> AgentState:
+    print("\n[Nodo 3] Generando Dosier Estructurado (JSON)...")
+    evaluated = state["evaluated_trials"]
+    
+    # Filtramos y ordenamos: solo elegibles o con score > 0, ordenados por score
+    ranked_trials = [t.model_dump() for t in evaluated if t.score > 0]
+    
+    dossier = {
+        "patient_profile": state["patient_profile"],
+        "extracted_mesh": state["mesh_terms"],
+        "recommended_trials": ranked_trials
+    }
+    
+    # Guardar en disco (Requisito de entregable no interactivo)
+    with open("predicciones_trec.json", "w", encoding="utf-8") as f:
+        json.dump(dossier, f, indent=4, ensure_ascii=False)
+        
+    print(f"   -> ¡Dosier guardado con {len(ranked_trials)} ensayos recomendados!")
+    return state # El estado no muta aquí
+
+# --- EN LA CONSTRUCCIÓN DEL GRAFO ---
+workflow.add_node("generate_dossier", generate_dossier_node)
+
+workflow.set_entry_point("retrieve_trials")
+workflow.add_edge("retrieve_trials", "evaluate_eligibility")
+workflow.add_edge("evaluate_eligibility", "generate_dossier") # Conectamos al nuevo nodo
+workflow.add_edge("generate_dossier", END)
 # 4. CONSTRUIMOS EL GRAFO DE LANGGRAPH (El "Flujo")
 workflow = StateGraph(AgentState)
 

@@ -2,26 +2,32 @@
 from langgraph.graph import StateGraph, END
 from langchain_community.chat_models import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
-from models import AgentState, TrialEvaluation
-from tools import fetch_clinical_trials
+from models import AgentState, TrialEvaluation, PatientExtraction
+from api_tools import fetch_clinical_trials
 
-# 1. INICIALIZAMOS EL LLM LOCAL
 llm = ChatOllama(model="llama3", temperature=0)
-# Importante: Usamos structured_output para forzar el JSON exacto de Pydantic
-structured_llm = llm.with_structured_output(TrialEvaluation)
 
-# 2. DEFINIMOS EL NODO DE RECUPERACIÓN (Tarea 1)
+# Instanciamos los parsers estructurados
+structured_llm_eval = llm.with_structured_output(TrialEvaluation)
+structured_llm_extract = llm.with_structured_output(PatientExtraction)
+
 def retrieve_node(state: AgentState) -> AgentState:
-    print("\n[Nodo 1] Recuperando ensayos clínicos...")
-    # En un sistema real extraeríamos la condición del patient_profile con otro LLM (MeSH). 
-    # Por ahora, mockeamos la condición para avanzar rápido.
-    trials = fetch_clinical_trials("Diabetes Type 2", max_results=5)
+    print("\n[Nodo 1] Analizando paciente y recuperando ensayos...")
+    patient = state["patient_profile"]
     
-    # LangGraph actualiza el estado devolviendo un diccionario con la clave a actualizar
-    return {"retrieved_trials": trials}
+    # 1. Extracción dinámica de la condición (Reemplaza el mock)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Eres un experto médico. Extrae la condición principal del paciente para consultar la API de ClinicalTrials.gov. Limítate a extraer la condición principal en inglés y 3 términos MeSH."),
+        ("user", "{patient}")
+    ])
+    extraction = (prompt | structured_llm_extract).invoke({"patient": patient})
+    print(f"   -> Condición detectada: {extraction.primary_condition}")
+    
+    # 2. Llamada real a la API
+    trials = fetch_clinical_trials(extraction.primary_condition, max_results=10)
+    
+    return {"retrieved_trials": trials, "mesh_terms": extraction.mesh_terms}
 
-# 3. DEFINIMOS EL NODO DE EVALUACIÓN (Tarea 2 y 4)
-# (Este es el código complejo de razonamiento médico)
 def evaluate_node(state: AgentState) -> AgentState:
     print("\n[Nodo 2] Verificación de elegibilidad estricta...")
     patient = state["patient_profile"]
@@ -35,20 +41,20 @@ def evaluate_node(state: AgentState) -> AgentState:
         3. 'is_eligible' DEBE ser False si existe al menos un criterio 'not met'."""),
         ("user", "PACIENTE:\n{patient}\n\nCRITERIOS:\n{criteria_text}\n\nID ENSAYO: {nct_id}")
     ])
-    chain = prompt | structured_llm
+    chain = prompt | structured_llm_eval
 
     for study in trials:
         nct_id = study.get("protocolSection", {}).get("identificationModule", {}).get("nctId")
         criteria_text = study.get("protocolSection", {}).get("eligibilityModule", {}).get("eligibilityCriteria", "")
 
         try:
-            result: TrialEvaluation = chain.invoke({
+            result = chain.invoke({
                 "patient": patient,
                 "criteria_text": criteria_text,
                 "nct_id": nct_id
             })
             
-            # Lógica dura de elegibilidad (Ranking - Tarea 3)
+            # Lógica dura de elegibilidad y Scoring
             total = len(result.criteria)
             met_count = sum(1 for c in result.criteria if c.status == 'met')
             nei_count = sum(1 for c in result.criteria if c.status == 'not enough info')
@@ -64,62 +70,21 @@ def evaluate_node(state: AgentState) -> AgentState:
 
     evaluated_list.sort(key=lambda x: x.score, reverse=True)
     return {"evaluated_trials": evaluated_list}
-import json
 
-def generate_dossier_node(state: AgentState) -> AgentState:
-    print("\n[Nodo 3] Generando Dosier Estructurado (JSON)...")
-    evaluated = state["evaluated_trials"]
-    
-    # Filtramos y ordenamos: solo elegibles o con score > 0, ordenados por score
-    ranked_trials = [t.model_dump() for t in evaluated if t.score > 0]
-    
-    dossier = {
-        "patient_profile": state["patient_profile"],
-        "extracted_mesh": state["mesh_terms"],
-        "recommended_trials": ranked_trials
-    }
-    
-    # Guardar en disco (Requisito de entregable no interactivo)
-    with open("predicciones_trec.json", "w", encoding="utf-8") as f:
-        json.dump(dossier, f, indent=4, ensure_ascii=False)
-        
-    print(f"   -> ¡Dosier guardado con {len(ranked_trials)} ensayos recomendados!")
-    return state # El estado no muta aquí
+def format_dossier_node(state: AgentState) -> AgentState:
+    # Este nodo ya no guarda a disco, solo limpia el estado para el batch
+    print("\n[Nodo 3] Formateando Dosier...")
+    return state # El output final se gestiona en el script de evaluación
 
-# --- EN LA CONSTRUCCIÓN DEL GRAFO ---
-workflow.add_node("generate_dossier", generate_dossier_node)
-
-workflow.set_entry_point("retrieve_trials")
-workflow.add_edge("retrieve_trials", "evaluate_eligibility")
-workflow.add_edge("evaluate_eligibility", "generate_dossier") # Conectamos al nuevo nodo
-workflow.add_edge("generate_dossier", END)
-# 4. CONSTRUIMOS EL GRAFO DE LANGGRAPH (El "Flujo")
+# CONSTRUCCIÓN DEL GRAFO (Una sola vez)
 workflow = StateGraph(AgentState)
-
-# Añadimos los nodos al grafo
 workflow.add_node("retrieve_trials", retrieve_node)
 workflow.add_node("evaluate_eligibility", evaluate_node)
+workflow.add_node("format_dossier", format_dossier_node)
 
-# Definimos el flujo lógico (Las flechas del diagrama)
 workflow.set_entry_point("retrieve_trials")
 workflow.add_edge("retrieve_trials", "evaluate_eligibility")
-workflow.add_edge("evaluate_eligibility", END) # Por ahora termina aquí
+workflow.add_edge("evaluate_eligibility", "format_dossier")
+workflow.add_edge("format_dossier", END)
 
-# Compilamos el agente
 app = workflow.compile()
-
-# 5. EJECUCIÓN PRINCIPAL
-if __name__ == "__main__":
-    print("Iniciando Sistema Agéntico UAB THE HACK!...")
-    
-    # Estado inicial (El input del paciente)
-    initial_state = {
-        "patient_profile": "Hombre de 65 años con diabetes tipo 2...",
-        "mesh_terms": [],
-        "retrieved_trials": [],
-        "evaluated_trials": []
-    }
-    
-    # Ejecutamos el grafo completo
-    final_state = app.invoke(initial_state)
-    print("\nEjecución completada. Ensayos evaluados y ordenados listos para Dosier.")

@@ -46,10 +46,44 @@ def retrieve_node(state: AgentState) -> AgentState:
         ("user", "{patient}")
     ])
     extraction = (prompt | structured_llm_extract).invoke({"patient": state["patient_profile"]})
-    print(f"   -> Condición detectada: {extraction.primary_condition}")
     
-    trials = fetch_clinical_trials(extraction.primary_condition, max_results=3) 
-    return {"retrieved_trials": trials, "mesh_terms": extraction.mesh_terms}
+    condicion_principal = extraction.primary_condition
+    
+    # 1. BÚSQUEDA ESPECÍFICA (Máximo 1 término MeSH para evitar Error 400)
+    terminos_limpios = extraction.mesh_terms[:1] if extraction.mesh_terms else []
+    query_compleja = f"{condicion_principal} {' '.join(terminos_limpios)}".strip()
+    
+    print(f"   -> Intentando búsqueda específica: {query_compleja}")
+    trials_finales = fetch_clinical_trials(query_compleja, max_results=3) 
+    
+    # 2. SISTEMA DE FALLBACK HÍBRIDO (Completar hasta 3 si faltan)
+    if len(trials_finales) < 3:
+        faltantes = 3 - len(trials_finales)
+        print(f"   -> [!] Solo se encontraron {len(trials_finales)} ensayos específicos.")
+        print(f"   -> [Fallback] Rellenando con búsqueda general: {condicion_principal}")
+        
+        # Buscamos en la general (pedimos 3 por si acaso hay duplicados que descartar)
+        trials_generales = fetch_clinical_trials(condicion_principal, max_results=3)
+        
+        # Extraemos los IDs que ya tenemos para NO DUPLICAR
+        ids_existentes = set()
+        for t in trials_finales:
+            nctid = t.get("protocolSection", {}).get("identificationModule", {}).get("nctId")
+            if nctid: ids_existentes.add(nctid)
+            
+        # Añadimos los generales hasta llegar a 3
+        for t in trials_generales:
+            if len(trials_finales) >= 3:
+                break # Ya tenemos los 3 ensayos
+                
+            nctid = t.get("protocolSection", {}).get("identificationModule", {}).get("nctId")
+            if nctid and nctid not in ids_existentes:
+                trials_finales.append(t)
+                ids_existentes.add(nctid)
+                
+    print(f"   -> Ensayos recuperados finales: {len(trials_finales)}")
+    
+    return {"retrieved_trials": trials_finales, "mesh_terms": extraction.mesh_terms}
 
 def evaluate_node(state: AgentState) -> AgentState:
     print("\n[Nodo 3] Verificación de elegibilidad estricta con CoT...")
@@ -66,8 +100,10 @@ def evaluate_node(state: AgentState) -> AgentState:
         2. VERIFICACIÓN CRUCIAL (Chain of Thought): Antes de dar el estado, usa el campo 'verification_step' para analizar. Comprueba las afirmaciones (sí/no) en el TEXTO ORIGINAL DEL PACIENTE. Ejemplo: si dice "prior cataract surgery: no", significa que NO se ha operado.
         3. ESTADOS ESTRICTOS: El campo 'status' DEBE SER EXACTAMENTE uno de estos tres valores: "met", "not_met", o "not_enough_info".
         4. PREGUNTA OBLIGATORIA: Si el status es 'not_enough_info', genera la 'missing_clinical_question'. Si es 'met' o 'not_met', escribe estrictamente "N/A".
-        5. REGLA ANTI-ALUCINACIONES (CERO SUPOSICIONES): La ausencia de información NO es cumplimiento. Si el texto del paciente NO menciona explícitamente un dato administrativo o clínico (ej. capacidad de firmar consentimientos, embarazos, asistir a citas, alergias), ESTÁ ESTRICTAMENTE PROHIBIDO asumir que lo cumple "por ser general". El estado DEBE ser "not_enough_info".
-    
+        5. REGLA ANTI-ALUCINACIONES MATIZADA (CLÍNICO vs. ADMINISTRATIVO): 
+            Debes distinguir estrictamente entre requisitos médicos y requisitos burocráticos/estándares.
+            - PARA DATOS CLÍNICOS (ej. enfermedades, alergias, embarazos, cirugías previas, valores de laboratorio): La ausencia de información NO es cumplimiento. CERO SUPOSICIONES. Si el texto NO lo menciona explícitamente, el estado DEBE ser "not_enough_info".
+            - PARA DATOS ADMINISTRATIVOS, LOGÍSTICOS O ESTÁNDARES (ej. capacidad o voluntad para firmar consentimiento informado, seguir instrucciones del estudio, asistir a citas, contestar cuestionarios): Aplica el "Principio de Presunción de Cumplimiento". Si el perfil del paciente NO indica expresamente una incapacidad para hacerlo (ej. no menciona demencia severa, rechazo a participar o barreras logísticas), ASUME que el paciente es un adulto funcional capaz de cumplirlo. El estado DEBE ser "met".    
         6. LÓGICA DE INCLUSIÓN VS EXCLUSIÓN: El estado "met" significa que el paciente SUPERA el filtro de ese criterio.
             - INCLUSIÓN (Debe tener X): Si lo tiene -> "met". Si no lo tiene -> "not_met".
             - EXCLUSIÓN (NO debe tener Y): Si LO TIENE -> "not_met" (es excluido del ensayo).
@@ -120,7 +156,14 @@ def evaluate_node(state: AgentState) -> AgentState:
             nei_count = sum(1 for c in result.criteria if c.status == 'not_enough_info')
             not_met_count = sum(1 for c in result.criteria if c.status == 'not_met')
             
-            is_eligible = (not_met_count == 0)
+            # --- NUEVA LÓGICA DE ELEGIBILIDAD ---
+            if not_met_count > 0:
+                is_eligible = "No Elegible"
+            elif met_count == 0 and nei_count > 0:
+                is_eligible = "Posible"
+            else:
+                is_eligible = "Elegible"
+            
             score = (met_count + (0.5 * nei_count)) / total if total > 0 else 0.0
             
             # Guardamos un diccionario en el estado
@@ -135,7 +178,10 @@ def evaluate_node(state: AgentState) -> AgentState:
             print(f"   - Error procesando {nct_id}: {e}")
 
     # Ordenamos la lista de diccionarios por score
-    evaluated_list.sort(key=lambda x: x["score"], reverse=True)
+    evaluated_list.sort( #Damos prioridad segun los Elegible, Posible y No elegible
+        key=lambda x: (2 if x["is_eligible"] == "Elegible" else 1 if x["is_eligible"] == "Posible" else 0, x["score"]), 
+        reverse=True
+    )    
     return {"evaluated_trials": evaluated_list}
 
 
@@ -153,16 +199,21 @@ workflow.add_edge("evaluate_eligibility", END)
 app = workflow.compile()
 
 
-
 def generar_dosier_markdown(topic_id, resultados_paciente):
     md_content = f"# Dosier de Preselección - Paciente {topic_id}\n\n"
     for trial in resultados_paciente:
-        estado = "✅ ELEGIBLE" if trial["is_eligible"] else "❌ NO ELEGIBLE"
+        # --- NUEVA LÓGICA DE VISUALIZACIÓN ---
+        if trial["is_eligible"] is True:
+            estado = "✅ ELEGIBLE"
+        elif trial["is_eligible"] is False:
+            estado = "❌ NO ELEGIBLE"
+        else:
+            estado = "⚠️ POSIBLE (Falta Informacion)"
+            
         md_content += f"## Ensayo: {trial['nct_id']} | Estado: {estado} | Score: {trial['score']:.2f}\n\n"
         md_content += "| Criterio | Estado | Razón | Pregunta Faltante |\n"
         md_content += "|---|---|---|---|\n"
         for det in trial["detalles"]:
-            # Limpiamos saltos de línea para que no rompan la tabla Markdown
             criterio_limpio = det['criterio'].replace('\n', ' ')
             razon_limpia = det['razon'].replace('\n', ' ')
             md_content += f"| {criterio_limpio} | **{det['estado']}** | {razon_limpia} | {det['pregunta_faltante']} |\n"

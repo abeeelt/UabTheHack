@@ -100,14 +100,11 @@ def evaluate_node(state: AgentState) -> AgentState:
         2. VERIFICACIÓN CRUCIAL (Chain of Thought): Antes de dar el estado, usa el campo 'verification_step' para analizar. Comprueba las afirmaciones (sí/no) en el TEXTO ORIGINAL DEL PACIENTE. Ejemplo: si dice "prior cataract surgery: no", significa que NO se ha operado.
         3. ESTADOS ESTRICTOS: El campo 'status' DEBE SER EXACTAMENTE uno de estos tres valores: "met", "not_met", o "not_enough_info".
         4. PREGUNTA OBLIGATORIA: Si el status es 'not_enough_info', genera la 'missing_clinical_question'. Si es 'met' o 'not_met', escribe estrictamente "N/A".
-        5. REGLA ANTI-ALUCINACIONES MATIZADA (CLÍNICO vs. ADMINISTRATIVO): 
-            Debes distinguir estrictamente entre requisitos médicos y requisitos burocráticos/estándares.
-            - PARA DATOS CLÍNICOS (ej. enfermedades, alergias, embarazos, cirugías previas, valores de laboratorio): La ausencia de información NO es cumplimiento. CERO SUPOSICIONES. Si el texto NO lo menciona explícitamente, el estado DEBE ser "not_enough_info".
-            - PARA DATOS ADMINISTRATIVOS, LOGÍSTICOS O ESTÁNDARES (ej. capacidad o voluntad para firmar consentimiento informado, seguir instrucciones del estudio, asistir a citas, contestar cuestionarios): Aplica el "Principio de Presunción de Cumplimiento". Si el perfil del paciente NO indica expresamente una incapacidad para hacerlo (ej. no menciona demencia severa, rechazo a participar o barreras logísticas), ASUME que el paciente es un adulto funcional capaz de cumplirlo. El estado DEBE ser "met".    
-        6. LÓGICA DE INCLUSIÓN VS EXCLUSIÓN: El estado "met" significa que el paciente SUPERA el filtro de ese criterio.
+        5. REGLA ANTI-ALUCINACIONES MATIZADA: PARA LA MAYORIA DE LOS DATOS SOBRETODO CLÍNICOS (ej. edad, genero, capacidad mental, enfermedades, alergias, embarazos, cirugías previas, valores de laboratorio): La ausencia de información NO es cumplimiento. CERO SUPOSICIONES. Si el texto NO lo menciona explícitamente, el estado DEBE ser "not_enough_info". Unica y rara excepcion: si es un  dato estandar o administrativo (ej. capacidad o voluntad para firmar consentimiento informado, seguir instrucciones del estudio, asistir a citas, contestar cuestionarios): Aplica el "Principio de Presunción de Cumplimiento", si el perfil del paciente NO indica expresamente una incapacidad para hacerlo (ej. no menciona demencia severa, rechazo a participar o barreras logísticas), ASUME que el paciente es un adulto funcional capaz de cumplirlo. El estado DEBE ser "met".    
+        6. LÓGICA DE INCLUSIÓN VS EXCLUSIÓN: El estado "met" significa que el paciente SUPERA el filtro de ese criterio. SI PUEDE HABER AUSENCIA DE INFORMACION CONSULTAR PASO 5
             - INCLUSIÓN (Debe tener X): Si lo tiene -> "met". Si no lo tiene -> "not_met".
             - EXCLUSIÓN (NO debe tener Y): Si LO TIENE -> "not_met" (es excluido del ensayo).
-            - EXCLUSIÓN (NO debe tener Y): Si NO LO TIENE -> "met" (pasa el filtro, es una condición favorable).
+            - EXCLUSIÓN (NO debe tener Y): Si PONE EXPLICITAMENTE QUE NO LO TIENE -> "met" (pasa el filtro, es una condición favorable). En caso de ausencia de informacion not_enough_info
 
         EJEMPLO DE EXCLUSIÓN SUPERADA:
             {{
@@ -156,14 +153,16 @@ def evaluate_node(state: AgentState) -> AgentState:
             nei_count = sum(1 for c in result.criteria if c.status == 'not_enough_info')
             not_met_count = sum(1 for c in result.criteria if c.status == 'not_met')
             
-            # --- NUEVA LÓGICA DE ELEGIBILIDAD ---
+
+
             if not_met_count > 0:
                 is_eligible = "No Elegible"
             elif met_count == 0 and nei_count > 0:
                 is_eligible = "Posible"
             else:
                 is_eligible = "Elegible"
-            
+
+
             score = (met_count + (0.5 * nei_count)) / total if total > 0 else 0.0
             
             # Guardamos un diccionario en el estado
@@ -203,12 +202,16 @@ def generar_dosier_markdown(topic_id, resultados_paciente):
     md_content = f"# Dosier de Preselección - Paciente {topic_id}\n\n"
     for trial in resultados_paciente:
         # --- NUEVA LÓGICA DE VISUALIZACIÓN ---
-        if trial["is_eligible"] is True:
+    # --- NUEVA LÓGICA DE ELEGIBILIDAD ---
+        estado_str = trial.get("is_eligible", "Error")
+        if estado_str == "Elegible":
             estado = "✅ ELEGIBLE"
-        elif trial["is_eligible"] is False:
+        elif estado_str == "No Elegible":
             estado = "❌ NO ELEGIBLE"
+        elif estado_str == "Posible":
+            estado = "⚠️ POSIBLE (Falta Información)"
         else:
-            estado = "⚠️ POSIBLE (Falta Informacion)"
+            estado = "🔴 ERROR DE EVALUACIÓN"
             
         md_content += f"## Ensayo: {trial['nct_id']} | Estado: {estado} | Score: {trial['score']:.2f}\n\n"
         md_content += "| Criterio | Estado | Razón | Pregunta Faltante |\n"

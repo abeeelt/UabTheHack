@@ -220,7 +220,7 @@ def generar_dosier_markdown(topic_id, resultados_paciente):
     md_content = f"# Dosier de Preselección - Paciente {topic_id}\n\n"
     for trial in resultados_paciente:
 
-        estado_str = trial.get("is_eligible", "Error")
+        estado_str = trial.get("is_eligible", "Error") #Ddatos JSON --> Tabla MarkDown
         if estado_str == "Elegible":
             estado = "✅ ELEGIBLE"
         elif estado_str == "No Elegible":
@@ -250,7 +250,7 @@ def generar_dosier_markdown(topic_id, resultados_paciente):
 
 #Bucle Principal
 if __name__ == "__main__":
-    topics = parse_topics("topics2023.xml")
+    topics = parse_topics("topics2023.xml") #Cargamos el BenchMark de Trek con nuestra herramienta
     if not topics:
         print("No se encontraron pacientes.")
         exit()
@@ -260,7 +260,7 @@ if __name__ == "__main__":
     archivo_resultados = "results_mejorado.json"
     resultados_finales = {}
 
-    # --- LÓGICA DE CHECKPOINT (RETOMAR PROGRESO) ---
+    #Sistema de Checkpoints para el JSON, si se interrumpe la ejecucion se lee hasta el ultimo paciente del JSON y se continua desde ahi
     if os.path.exists(archivo_resultados):
         try:
             with open(archivo_resultados, "r", encoding="utf-8") as f:
@@ -269,11 +269,11 @@ if __name__ == "__main__":
         except Exception as e:
             print("[!] El archivo JSON existe pero está corrupto o vacío. Empezando de cero.")
 
-    # OJO: He quitado el [:1] para que recorra todos los pacientes
+    
     for topic in topics:
         topic_id_str = str(topic['id'])
         
-        # Si el paciente ya está en el JSON, nos lo saltamos
+        #Si el paciente ya está en el JSON nos lo saltamos
         if topic_id_str in resultados_finales:
             print(f"[*] Saltando Paciente ID: {topic_id_str} (Ya evaluado)")
             continue
@@ -290,11 +290,11 @@ if __name__ == "__main__":
             "evaluated_trials": [],
         }
 
-        # Ejecutamos el agente
+        #Ejecutamos el grafo
         final_state = app.invoke(initial_state)
         
         ranking_paciente = []
-        for trial in final_state.get("evaluated_trials", []):
+        for trial in final_state.get("evaluated_trials", []): #Preparamos el output final
             ranking_paciente.append({
                 "nct_id": trial["nct_id"], 
                 "is_eligible": trial["is_eligible"],
@@ -310,17 +310,15 @@ if __name__ == "__main__":
                 ]
             })
             
-        # Añadimos el paciente recién procesado a los resultados
+        #Añadimos el paciente recién procesado a los resultados
         resultados_finales[topic_id_str] = ranking_paciente
 
-        # --- GUARDADO INCREMENTAL ---
-        # Guardamos a disco DESPUÉS DE CADA PACIENTE. Si detienes el PC, no pierdes nada.
+        #Guardamos a disco DESPUES DE CADA PACIENTE asi no se pierde info
         with open(archivo_resultados, "w", encoding="utf-8") as f:
             json.dump(resultados_finales, f, indent=4, ensure_ascii=False)
             print(f"[*] Datos del Paciente {topic_id_str} guardados a disco correctamente.")
             
-        # --- GENERAR DOSIER (TAREA 5) ---
-        # Ahora SÍ llamamos a tu función para que cree el archivo Markdown
+        #Hacemos el dosier de cada paciente
         generar_dosier_markdown(topic['id'], ranking_paciente)
         
     print("\n¡PROCESO COMPLETADO! Todos los pacientes han sido evaluados.")

@@ -1,25 +1,36 @@
+#Grupo formado por: Abel, Guilherme, Santi y Uven
+
+
+#··························
+#MAIN
+#··························
+
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-import os  # <--- AÑADE ESTO PARA LEER ARCHIVOS
+import os #Para leer archivos
 import json
 
 from models import AgentState, TrialEvaluation, PatientExtraction, StructuredPatient
 from herramientas import fetch_clinical_trials, parse_topics
 
-# 1. CONFIGURACIÓN DEL MODELO
+#CONFIGURAR EL MODELO --> LM Studio 
 llm = ChatOpenAI(
     base_url="http://localhost:1234/v1",
     api_key="lm-studio",
     model="local-model",
-    temperature=0
+    temperature=0, #Determinista, No creatiu
+
+    max_retries=1, #Esto lo hemos añadido porque con el paciente 15 entra en un bucle en el Nodo1 al estructurar el paciente.
+    timeout=150.0 #Si tarda demasiado no lo estructura y usa el texto crudo
 )
 
-structured_llm_extract = llm.with_structured_output(PatientExtraction)
+structured_llm_extract = llm.with_structured_output(PatientExtraction) #Que el modelo  responda con los formatos de models.py
 structured_llm_eval = llm.with_structured_output(TrialEvaluation)
 structured_llm_patient = llm.with_structured_output(StructuredPatient)
 
-# 2. NODOS DEL GRAFO
+#NODOS DEL GRAFO
+#1. Estructurar Paciente
 def structure_patient_node(state: AgentState) -> AgentState:
     print("\n[Nodo 1] Estructurando perfil del paciente...")
     patient_raw = state["patient_profile"]
@@ -33,15 +44,17 @@ def structure_patient_node(state: AgentState) -> AgentState:
         clean_patient = (prompt | structured_llm_patient).invoke({"patient": patient_raw})
         clean_patient_str = clean_patient.model_dump_json(indent=2)
         print("   -> Paciente estructurado con éxito.")
-    except Exception as e:
+    except Exception as e: #Si el LLM falla o se queda en bucle, (hemos puesto un timeout en la configuracion) --> Usa el texto crudo sin estructurar
         print(f"   -> Error estructurando. Usando texto bruto.")
         clean_patient_str = patient_raw
         
     return {"structured_patient": clean_patient_str}
 
+
+#2. Buscar y recuperar (Tarea 1)
 def retrieve_node(state: AgentState) -> AgentState:
     print("\n[Nodo 2] Buscando ensayos clínicos...")
-    prompt = ChatPromptTemplate.from_messages([
+    prompt = ChatPromptTemplate.from_messages([ #Sacamos la condicion medica principal y pegarsela a la API
         ("system", "Extrae la condición médica principal en inglés para buscar en la base de datos."),
         ("user", "{patient}")
     ])
@@ -49,23 +62,22 @@ def retrieve_node(state: AgentState) -> AgentState:
     
     condicion_principal = extraction.primary_condition
     
-    # 1. BÚSQUEDA ESPECÍFICA (Máximo 1 término MeSH para evitar Error 400)
+    #Primero intentamos Buscando específicamente con 1 termino MeSH (algo simple)
     terminos_limpios = extraction.mesh_terms[:1] if extraction.mesh_terms else []
     query_compleja = f"{condicion_principal} {' '.join(terminos_limpios)}".strip()
     
     print(f"   -> Intentando búsqueda específica: {query_compleja}")
     trials_finales = fetch_clinical_trials(query_compleja, max_results=3) 
     
-    # 2. SISTEMA DE FALLBACK HÍBRIDO (Completar hasta 3 si faltan)
+    #Si no se han encontrado tres ensayos--> Completamos hasta los 3 pasando de buscar especificamente --> buscamos con la condicion general, NUNCA FALLA
     if len(trials_finales) < 3:
         faltantes = 3 - len(trials_finales)
         print(f"   -> [!] Solo se encontraron {len(trials_finales)} ensayos específicos.")
         print(f"   -> [Fallback] Rellenando con búsqueda general: {condicion_principal}")
         
-        # Buscamos en la general (pedimos 3 por si acaso hay duplicados que descartar)
         trials_generales = fetch_clinical_trials(condicion_principal, max_results=3)
         
-        # Extraemos los IDs que ya tenemos para NO DUPLICAR
+        #Cogemos los IDs que ya tenemos para NO DUPLICAR ni meterle el mismo ensayo dos veces
         ids_existentes = set()
         for t in trials_finales:
             nctid = t.get("protocolSection", {}).get("identificationModule", {}).get("nctId")
@@ -85,6 +97,7 @@ def retrieve_node(state: AgentState) -> AgentState:
     
     return {"retrieved_trials": trials_finales, "mesh_terms": extraction.mesh_terms}
 
+#3. Verificar (Tarea 2 y 4) y Ranking (Tarea3)
 def evaluate_node(state: AgentState) -> AgentState:
     print("\n[Nodo 3] Verificación de elegibilidad estricta con CoT...")
     clean_patient = state.get("structured_patient", "") 
@@ -92,6 +105,7 @@ def evaluate_node(state: AgentState) -> AgentState:
     trials = state["retrieved_trials"]
     evaluated_list = []
 
+    #Prompt de la evaluación, se ha modificado muchisimas veces añadiendo reglas en base a errores que daba el LLM, es un modelo muy simple asi que le cuesta. 
     prompt = ChatPromptTemplate.from_messages([
         ("system", """Eres un evaluador clínico estricto y literal. Tu tarea es cruzar el perfil de un paciente con los criterios de un ensayo clínico.
         
@@ -132,10 +146,15 @@ def evaluate_node(state: AgentState) -> AgentState:
     ])
     chain = prompt | structured_llm_eval
 
-    for study in trials:
+    for study in trials: #Analizamos cada ensayo
         nct_id = study.get("protocolSection", {}).get("identificationModule", {}).get("nctId", "N/A")
         criteria_text = study.get("protocolSection", {}).get("eligibilityModule", {}).get("eligibilityCriteria", "")
-
+        
+        #Añadimos esto a partir del PACIENTE 15 para que el modelo local solo evalue unos 3 o 4 Criterios y que vaya más rápido. Con todos los criterios esta dedicando unos 10 minutos por paciente que es demasiado.
+        if len(criteria_text) > 1000:
+            criteria_text = criteria_text[:1000] + "..."
+        
+        
         if not criteria_text:
             continue
 
@@ -147,25 +166,24 @@ def evaluate_node(state: AgentState) -> AgentState:
                 "nct_id": nct_id
             })
             
- # --- CÁLCULO EN PYTHON PURO (Lo que recomendaba la otra IA, pero con nuestra fórmula) ---
+        #Calculamos en Python, antes le dejabamos al modelo calcular el ranking pero es mejor hacerlo de esta manera para no saturarlo y dar resultado que siempre sigan la misma logica
             total = len(result.criteria)
             met_count = sum(1 for c in result.criteria if c.status == 'met')
             nei_count = sum(1 for c in result.criteria if c.status == 'not_enough_info')
             not_met_count = sum(1 for c in result.criteria if c.status == 'not_met')
             
 
-
-            if not_met_count > 0:
+            if not_met_count > 0: #Con un solo not met ya no es elegible
                 is_eligible = "No Elegible"
-            elif met_count == 0 and nei_count > 0:
+            elif met_count == 0 and nei_count > 0: #Hemos añadido el estado posible por si todos los criterios los pasa como not_enough_info
                 is_eligible = "Posible"
             else:
                 is_eligible = "Elegible"
 
-
-            score = (met_count + (0.5 * nei_count)) / total if total > 0 else 0.0
+            #Nuestro calculo del score
+            score = (met_count + (0.5 * nei_count)) / total if total > 0 else 0.0 
             
-            # Guardamos un diccionario en el estado
+            #gardamos un diccionario en el estado con el ID, el score y los resultados
             evaluated_list.append({
                 "nct_id": result.nct_id,
                 "is_eligible": is_eligible,
@@ -176,8 +194,8 @@ def evaluate_node(state: AgentState) -> AgentState:
         except Exception as e:
             print(f"   - Error procesando {nct_id}: {e}")
 
-    # Ordenamos la lista de diccionarios por score
-    evaluated_list.sort( #Damos prioridad segun los Elegible, Posible y No elegible
+    #ordenamos la lista de diccionarios por score pero damos prioridad segun los Elegible, Posible y No elegible
+    evaluated_list.sort(
         key=lambda x: (2 if x["is_eligible"] == "Elegible" else 1 if x["is_eligible"] == "Posible" else 0, x["score"]), 
         reverse=True
     )    
@@ -185,7 +203,7 @@ def evaluate_node(state: AgentState) -> AgentState:
 
 
     
-# 3. CONSTRUCCIÓN DEL GRAFO
+#Construimos el gafo (LangGraph) --> Añadimos los nodos y conectamos como flujo lineal
 workflow = StateGraph(AgentState)
 workflow.add_node("structure_patient", structure_patient_node) 
 workflow.add_node("retrieve_trials", retrieve_node) 
@@ -197,12 +215,11 @@ workflow.add_edge("retrieve_trials", "evaluate_eligibility")
 workflow.add_edge("evaluate_eligibility", END)
 app = workflow.compile()
 
-
+#Generamos un dosier para cada paciente con los resultados del json(Tarea 5)
 def generar_dosier_markdown(topic_id, resultados_paciente):
     md_content = f"# Dosier de Preselección - Paciente {topic_id}\n\n"
     for trial in resultados_paciente:
-        # --- NUEVA LÓGICA DE VISUALIZACIÓN ---
-    # --- NUEVA LÓGICA DE ELEGIBILIDAD ---
+
         estado_str = trial.get("is_eligible", "Error")
         if estado_str == "Elegible":
             estado = "✅ ELEGIBLE"
@@ -231,7 +248,7 @@ def generar_dosier_markdown(topic_id, resultados_paciente):
 
 
 
-# 4. EJECUCIÓN PRINCIPAL
+#Bucle Principal
 if __name__ == "__main__":
     topics = parse_topics("topics2023.xml")
     if not topics:
